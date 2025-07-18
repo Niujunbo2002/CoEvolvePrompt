@@ -41,32 +41,44 @@ outputs_name =  pretrained_model.replace("/", ".") + "-" + dataset
 os.makedirs(os.path.dirname("./temp_data/outputs-rl-" + outputs_name + ".json"), exist_ok=True)
 with open("./temp_data/outputs-rl-" + outputs_name + ".json", 'r') as f:
     data = json.load(f)
-
-
-index_list = []
-extracted_output_list = []
-ground_truth_list = []
-for i in range(len(data)):
-    data[i]["correctness"] = []
-    index_list = index_list + [i] * len(data[i]["extracted_output"])
-    extracted_output_list = extracted_output_list + data[i]["extracted_output"]
-    ground_truth_list = ground_truth_list + [data[i]["ground_truth_answer"]] * len(data[i]["extracted_output"])
+    
+os.makedirs(os.path.dirname("../temp_data/rl_data_response.json"), exist_ok=True)
+with open("./temp_data/rl_data_response.json", 'r') as f:
+    data_pit = json.load(f)
 
 nest_asyncio.apply()
 
-async def get_correctness():
+def flatten_correctness_inputs(data_list):
+    index_list = []
+    extracted_output_list = []
+    ground_truth_list = []
+
+    for i, item in enumerate(data_list):
+        item["correctness"] = []
+        num_outputs = len(item["extracted_output"])
+        index_list.extend([i] * num_outputs)
+        extracted_output_list.extend(item["extracted_output"])
+        ground_truth_list.extend([item["ground_truth_answer"]] * num_outputs)
+    
+    return index_list, extracted_output_list, ground_truth_list
+
+async def compute_correctness_async(extracted_outputs, ground_truths):
     executor = ThreadPoolExecutor(max_workers=64)
-    tasks = []
-    for i in range(len(index_list)):
-        tasks.append(math_utils.is_equal(extracted_output_list[i], ground_truth_list[i], executor))
-    results = await asyncio.gather(*tasks)
-    return results
+    tasks = [
+        math_utils.is_equal(pred, gt, executor)
+        for pred, gt in zip(extracted_outputs, ground_truths)
+    ]
+    return await asyncio.gather(*tasks)
 
-correctness_list = asyncio.run(get_correctness())
-for i in range(len(index_list)):
-    index_i = index_list[i]
-    data[index_i]["correctness"].append(correctness_list[i])
+def compute_correctness(data_list):
+    index_list, extracted_outputs, ground_truths = flatten_correctness_inputs(data_list)
+    correctness_list = asyncio.run(compute_correctness_async(extracted_outputs, ground_truths))
+    for idx, corr in zip(index_list, correctness_list):
+        data_list[idx]["correctness"].append(corr)
 
+
+compute_correctness(data)
+compute_correctness(data_pit)
 
 
 def z_score_normalize(lst):
@@ -76,24 +88,44 @@ def z_score_normalize(lst):
         return [0 for x in lst]
     return [(x - mean) / std for x in lst]
 
+all_data = []
+pit_data = []
 final_data = []
+
+# reward for all responses (n + m * k)
 for i in range(len(data)):
-    correctness = data[i]["correctness"]
+    correctness = data[i]["correctness"] 
     lengths = data[i]["response_length"]
     rewards = z_score_normalize(correctness)
     data[i]["rewards"] = rewards
     
-
-    for j in range(len(rewards)):
+    
+    for j in range(len(rewards)): 
         data_i = {}
-        data_i["prompt"] = data[i]["prompt"]
+        data_i["prompt"] = data[i]["prompt"] 
+        
         data_i["reward"] = rewards[j]
         if lengths[j] < max_generation_len:
-            data_i["response"] = data[i]["full_output"][j] + "<|im_end|>"
+            data_i["response"] = data[i]["full_output"][j] + "<|im_end|>" 
         else:
-            data_i["response"] = data[i]["full_output"][j]
-        final_data.append(data_i)
+            data_i["response"] = data[i]["full_output"][j] 
+        all_data.append(data_i)
 
+# reward for pits
+for i in range(len(data_pit)):
+    correctness = data_pit[i]["correctness"] 
+    lengths = data_pit[i]["response_length"]
+    reward = sum(correctness) / len(correctness)
+    data_pit[i]["rewards"] = reward
+    
+    data_i = {}
+    data_i["prompt"] = data_pit[i]["prompt"] 
+    data_i["response"] = data_pit[i]["response"] 
+    data_i["reward"] = reward
+        
+    pit_data.append(data_i)
+    
+final_data = all_data + pit_data
 
 with open("./temp_data/rl_data.json", "w", encoding="utf-8") as f:
     json.dump(final_data, f, indent=2, ensure_ascii=False)
