@@ -140,6 +140,8 @@ def parse_args():
     parser.add_argument("--random_select_num", type=int, default=optimization_config.n_sample_per_step)
     parser.add_argument("--gpu_groups", type=ast.literal_eval, default=optimization_config.gpu_groups)
     parser.add_argument("--system_prompts", type=str, default=optimization_config.system_prompts)
+    parser.add_argument("--pit_prompts", type=str, default=optimization_config.pit_prompts)
+    parser.add_argument("--m_regenerate", type=int, default=optimization_config.m_regenerate)
     return parser.parse_args()
 
 args = parse_args()
@@ -174,7 +176,9 @@ if if_start_with_think:
     system_case_prompts = system_case_prompts + "<think>\n"
 
 
-
+if if_start_with_think:
+    pit_prompts = pit_prompts + "<think>\n"
+    pit_case_prompts = pit_case_prompts + "<think>\n"
 
 
 
@@ -185,6 +189,31 @@ def bernoulli(p):
 # obtain prompt
 def get_prompt(data_i):
     return Template(system_prompts).render(problem = data_i["question"])
+
+def get_pit_prompt(data_i):
+    return Template(pit_prompts).render(problem = data_i["question"], 
+                                        incorrect_answer = data_i["extracted_output"],
+                                        #full_incorrect_response = data_i["full_output"],
+                                        correct_answer = data_i["ground_truth_answer"])
+
+def inject_new_prompt(system_prompts: str, new_prompt: str) -> str:
+    parts = system_prompts.split("<|im_end|>")
+    system_msg = parts[0] + "<|im_end|>"  # system message block
+    rest = "<|im_end|>".join(parts[1:])   # user + assistant block
+
+    import re
+    match = re.search(r"\\boxed_prompt{(.*?)}", new_prompt, re.DOTALL)
+    extracted_prompt = match.group(1).strip() if match else ""
+
+    enhanced_system = system_msg.replace(
+        "You are a helpful assistant help user solve problems.",
+        f"You are a helpful assistant who helps users solve problems. {extracted_prompt}"
+    )
+
+    return enhanced_system + rest
+
+
+
 
 
 def extract_final_boxed_answer(s: str):
@@ -216,11 +245,11 @@ def extract_final_boxed_answer(s: str):
 
 # initialization
 generation_prompts = []
-index_list = []
+index_list = [] 
 for i in range(num):
     # preprocess
-    generation_prompts = generation_prompts + [get_prompt(data[i])] * k_sample
-    index_list = index_list + [i] * k_sample
+    generation_prompts = generation_prompts + [get_prompt(data[i])] * k_sample 
+    index_list = index_list + [i] * k_sample #[1]*[10] = [1,1,1,1,1,1,1,1,1,1]
     data[i]["full_output"] = []
     data[i]["extracted_output"] = []
     data[i]["response_length"] = []
@@ -235,24 +264,26 @@ for i in range(num):
 
 # sampling process
 
-cprint("start generation...", "green")
+def sample_process(generation_prompts, gpu_groups, task_queues, result_queues):
+    cprint("start generation...", "green")
 
-# shuffle first, to achieve efficiency
-all_prompts = generation_prompts
-N = len(all_prompts)
-indices = list(range(N))
-shuffled_idx = indices[:]      
-random.shuffle(shuffled_idx)
-shuffled_prompts = [all_prompts[i] for i in shuffled_idx]
-# generate
-shuffled_outputs = generate_results(shuffled_prompts, gpu_groups, task_queues, result_queues)
-restored_outputs = [None] * N
-for out, idx in zip(shuffled_outputs, shuffled_idx):
-    restored_outputs[idx] = out
+    # shuffle first, to achieve efficiency
+    all_prompts = generation_prompts
+    N = len(all_prompts)
+    indices = list(range(N))
+    shuffled_idx = indices[:]      
+    random.shuffle(shuffled_idx)
+    shuffled_prompts = [all_prompts[i] for i in shuffled_idx]
+    # generate
+    shuffled_outputs = generate_results(shuffled_prompts, gpu_groups, task_queues, result_queues)
+    restored_outputs = [None] * N
+    for out, idx in zip(shuffled_outputs, shuffled_idx):
+        restored_outputs[idx] = out
 
-cprint("generation job done!", "green")
+    cprint("generation job done!", "green")
+    return restored_outputs
 
-
+restored_outputs = sample_process(generation_prompts, gpu_groups, task_queues, result_queues)
 
 
 
@@ -283,21 +314,81 @@ with open("./results/results-" + outputs_name + ".txt", "a") as f:
 
 # process generated codes
 i = 0
+
+data_pit = [] 
+tmp_new_prompts = []
+tmp_new_list = []
+
+j = 0
 for full_output in restored_outputs:
-    extracted_output = extract_final_boxed_answer(full_output)
+    extracted_output = extract_final_boxed_answer(full_output) 
     index_i = index_list[i]
     data[index_i]["full_output"].append(full_output)
-    data[index_i]["extracted_output"].append(extracted_output)
+    data[index_i]["extracted_output"].append(extracted_output) 
+    
+    if extracted_output != data[index_i]["ground_truth_answer"]:
+        data_pit.append({})
+        data_pit[j]["prompt"] = data[index_i]["prompt"] 
+        
+        tmp_new_prompts = tmp_new_prompts + [get_pit_prompt(data[index_i])]
+        tmp_new_list = tmp_new_list + [index_i]
+        
+        j += 1;
+        
     data[index_i]["response_length"].append(response_length[i])
     i += 1
 
 
+# start generation of new prompts
+restored_prompts = sample_process(tmp_new_prompts, gpu_groups, task_queues, result_queues)
+response_length = get_token_lengths(restored_prompts, tokenizer)
+i = 0
+new_generation_prompts = [] 
+new_index_list = [] 
+
+for new_prompt in restored_prompts: 
+    index_i = tmp_new_list[i]
+    data_pit[i]["meta_prompt"] = new_prompt
+    data_pit[i]["response"] = inject_new_prompt(data[index_i]["prompt"], new_prompt) 
+    
+    data_pit[i]["ground_truth_answer"] = data[index_i]["ground_truth_answer"] 
+    data_pit[i]["extracted_output"] = [] 
+    data_pit[i]["response_length"] = response_length[i]
+    
+    new_generation_prompts = new_generation_prompts + [data_pit[i]["response"]] * m_regenerate
+    new_index_list = new_index_list + [index_i] * m_regenerate 
+    i += 1
+
+
+
+#generation of new answers
+i = 0
+restored_outputs = sample_process(new_generation_prompts, gpu_groups, task_queues, result_queues)
+response_length = get_token_lengths(restored_outputs, tokenizer)
+
+for full_output in restored_outputs:
+    extracted_output = extract_final_boxed_answer(full_output)
+    index_i = new_index_list[i]
+    
+    data_pit[i//m_regenerate]["extracted_output"].append(extracted_output) 
+    
+    data[index_i]["full_output"].append(full_output)
+    data[index_i]["extracted_output"].append(extracted_output)
+    data[index_i]["response_length"].append(response_length[i])
+    i += 1
+    
+    
+
+
+
 # output the data
+os.makedirs(os.path.dirname("./temp_data/rl_data_response.json"), exist_ok=True)
+with open("./temp_data/rl_data_response.json", "w", encoding="utf-8") as f:
+    json.dump(data_pit, f, indent=2, ensure_ascii=False)
+
 os.makedirs(os.path.dirname("./temp_data/outputs-" + outputs_name + ".json"), exist_ok=True)
 with open("./temp_data/outputs-" + outputs_name + ".json", "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 
 stop_workers(task_queues, processes)
 
